@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# Mac
+.DS_Store
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# App
+*.app
+*.zip
+*.log
