@@ -3,9 +3,11 @@ import sounddevice as sd
 import numpy as np
 import threading
 import time
-
 import sys
 import os
+import logging
+import plistlib
+from pathlib import Path
 
 # PyInstaller에서 리소스 경로 찾기 위한 함수
 def resource_path(relative_path):
@@ -28,9 +30,6 @@ def resource_path(relative_path):
 
 # 앱 이름 및 아이콘 설정 (빌드 시 아이콘 적용됨)
 APP_NAME = "Night Mode"
-
-import logging
-import os
 
 # 디버그 로깅 설정 (사용자 홈 디렉토리에 로그 파일 생성)
 log_file = os.path.expanduser("~/night_mode_debug.log")
@@ -60,6 +59,9 @@ class NightModeApp(rumps.App):
         
         self.build_menu()
         self.refresh_devices(None)
+        
+        # 자동 실행 상태 초기화
+        self.menu["설정"]["로그인 시 자동 실행"].state = self.is_auto_start_enabled()
 
 
     def build_menu(self):
@@ -84,6 +86,10 @@ class NightModeApp(rumps.App):
             output_menu = rumps.MenuItem("출력 장치 선택")
             output_menu.add(rumps.MenuItem("목록 새로고침", callback=self.refresh_devices))
             output_menu.add(rumps.separator)
+            
+            # 5. Settings Submenu
+            settings_menu = rumps.MenuItem("설정")
+            settings_menu.add(rumps.MenuItem("로그인 시 자동 실행", callback=self.toggle_auto_start))
 
             # Assign to app.menu
             self.menu = [
@@ -93,6 +99,7 @@ class NightModeApp(rumps.App):
                 gain_menu,
                 rumps.separator,
                 output_menu,
+                settings_menu,
                 rumps.separator,
                 rumps.MenuItem("종료", callback=rumps.quit_application)
             ]
@@ -104,6 +111,54 @@ class NightModeApp(rumps.App):
         except Exception as e:
             logging.error(f"Menu build failed: {e}")
             raise e
+
+    # --- 자동 실행 관리 ---
+    def get_plist_path(self):
+        return Path.home() / "Library" / "LaunchAgents" / "com.lizstudio.nightmodeaudio.plist"
+
+    def is_auto_start_enabled(self):
+        return self.get_plist_path().exists()
+
+    def toggle_auto_start(self, sender):
+        plist_path = self.get_plist_path()
+        if sender.state:
+            # 비활성화
+            if plist_path.exists():
+                plist_path.unlink()
+            sender.state = False
+            logging.info("Auto-start disabled")
+        else:
+            # 활성화
+            try:
+                # 현재 실행 중인 앱 경로 찾기
+                if getattr(sys, 'frozen', False):
+                    # .app 패키지 안의 실제 실행 파일 경로는 Contents/MacOS/NightModeAudio 임
+                    # 하지만 Launch Agent는 .app 자체를 여는 것이 나을 수 있음
+                    executable_path = sys.executable
+                    # 만약 .app 내부에 있다면 패키지 경로를 사용
+                    if ".app/Contents/MacOS/" in executable_path:
+                        app_path = executable_path.split(".app/Contents/MacOS/")[0] + ".app"
+                    else:
+                        app_path = executable_path
+                else:
+                    app_path = os.path.abspath(sys.argv[0])
+
+                plist_data = {
+                    "Label": "com.lizstudio.nightmodeaudio",
+                    "ProgramArguments": ["/usr/bin/open", "-n", app_path],
+                    "RunAtLoad": True,
+                    "ProcessType": "Interactive"
+                }
+                
+                plist_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(plist_path, 'wb') as f:
+                    plistlib.dump(plist_data, f)
+                
+                sender.state = True
+                logging.info(f"Auto-start enabled for: {app_path}")
+            except Exception as e:
+                logging.error(f"Failed to enable auto-start: {e}")
+                rumps.alert("오류", f"자동 실행 설정에 실패했습니다: {e}")
 
     # --- 장치 관리 ---
     def refresh_devices(self, _):
@@ -117,16 +172,12 @@ class NightModeApp(rumps.App):
 
         # BlackHole 찾기 (입력 고정)
         self.input_device = None
-        blackhole_idx = None
         
         for i, dev in enumerate(self.devices):
             if "BlackHole" in dev['name'] and dev['max_input_channels'] > 0:
                 self.input_device = i
-                blackhole_idx = i
             
             if dev['max_output_channels'] > 0:
-                # BlackHole은 출력 목록에서 제외 (루프백 방지) 또는 선택 가능하게 둠?
-                # 출력으로 BlackHole을 고르면 소리가 안 들리므로 제외하는 게 나음.
                 if "BlackHole" not in dev['name']:
                     item = rumps.MenuItem(dev['name'], callback=self.select_output)
                     out_menu.add(item)
@@ -135,19 +186,17 @@ class NightModeApp(rumps.App):
              rumps.alert("오류", "BlackHole 2ch 드라이버를 찾을 수 없습니다. 설치를 확인해주세요.")
 
     def select_output(self, sender):
-        # 모든 출력 장치 체크 해제
         for item in self.menu["출력 장치 선택"].values():
-            item.state = False
+            if isinstance(item, rumps.MenuItem):
+                item.state = False
         
         sender.state = True
         
-        # 선택된 장치 인덱스 찾기
         for i, dev in enumerate(self.devices):
             if dev['name'] == sender.title and dev['max_output_channels'] > 0:
                 self.output_device = i
                 break
         
-        # 실행 중이면 재시작
         if self.is_running:
             self.stop_audio()
             self.start_audio()
@@ -155,10 +204,8 @@ class NightModeApp(rumps.App):
     # --- 설정 변경 ---
     def set_threshold(self, db, item_title):
         self.threshold_db = db
-        # 메뉴 체크 업데이트
         for item in self.menu["압축 강도 (Threshold)"].values():
             item.state = (item.title == item_title)
-        print(f"Threshold set to {self.threshold_db}")
 
     def set_threshold_weak(self, sender): self.set_threshold(-10.0, sender.title)
     def set_threshold_normal(self, sender): self.set_threshold(-20.0, sender.title)
@@ -168,7 +215,6 @@ class NightModeApp(rumps.App):
         self.makeup_gain_db = db
         for item in self.menu["볼륨 증폭 (Gain)"].values():
             item.state = (item.title == item_title)
-        print(f"Gain set to {self.makeup_gain_db}")
 
     def set_gain_low(self, sender): self.set_gain(0.0, sender.title)
     def set_gain_normal(self, sender): self.set_gain(10.0, sender.title)
@@ -180,7 +226,6 @@ class NightModeApp(rumps.App):
             self.stop_audio()
             sender.title = "야간 모드 시작"
             sender.state = False
-            self.icon = resource_path("menu_icon.png") # 기본 아이콘
         else:
             if self.output_device is None:
                 rumps.alert("알림", "출력 장치를 먼저 선택해주세요!")
@@ -190,14 +235,13 @@ class NightModeApp(rumps.App):
             if success:
                 sender.title = "정지 (작동 중)"
                 sender.state = True
-                self.icon = resource_path("menu_icon_on.png") # 활성 아이콘 (컬러)
-                self.title = None # 텍스트 제거 (사용자 요청)
+                self.icon = resource_path("menu_icon_on.png")
+                self.title = None
 
     def start_audio(self):
         try:
             if self.input_device is None: return False
 
-            # 장치 정보 확인 (채널 매칭)
             input_info = sd.query_devices(self.input_device, 'input')
             output_info = sd.query_devices(self.output_device, 'output')
             
@@ -205,9 +249,6 @@ class NightModeApp(rumps.App):
             channels = min(2, int(input_info['max_input_channels']), int(output_info['max_output_channels']))
 
             def callback(indata, outdata, frames, time, status):
-                if status: print(status)
-                
-                # 처리 로직 (이전과 동일)
                 audio_data = indata.flatten()
                 rms = np.sqrt(np.mean(audio_data**2))
                 if rms <= 0: rms = 1e-9
@@ -231,7 +272,7 @@ class NightModeApp(rumps.App):
                 device=(self.input_device, self.output_device),
                 channels=channels,
                 samplerate=sr,
-                blocksize=512, # 안정성 (Overflow 방지)
+                blocksize=512,
                 latency='low',
                 callback=callback
             )
@@ -249,7 +290,7 @@ class NightModeApp(rumps.App):
             self.stream.close()
             self.stream = None
         self.is_running = False
-        self.title = None # 아이콘만 보이게 복구
+        self.title = None
         self.icon = resource_path("menu_icon.png")
 
 if __name__ == "__main__":
