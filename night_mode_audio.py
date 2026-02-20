@@ -7,6 +7,7 @@ import sys
 import os
 import logging
 import plistlib
+import json
 from pathlib import Path
 
 # PyInstaller에서 리소스 경로 찾기 위한 함수
@@ -52,16 +53,26 @@ class NightModeApp(rumps.App):
         self.input_device = None
         self.output_device = None
         
-        # 압축 기본 설정
+        # 기본 설정값 (로드 실패 시 사용)
         self.threshold_db = -20.0
         self.makeup_gain_db = 10.0
         self.ratio = 4.0
+        self.saved_device_name = None
+        self.should_auto_start_processing = False
+
+        # 설정 로드
+        self.load_config()
         
         self.build_menu()
         self.refresh_devices(None)
         
-        # 자동 실행 상태 초기화
+        # 자동 실행 플래시 동기화 (Launch Agent)
         self.menu["설정"]["로그인 시 자동 실행"].state = self.is_auto_start_enabled()
+        
+        # 저장된 설정에 따라 야간 모드 자동 시작
+        if self.should_auto_start_processing and self.output_device is not None:
+            logging.info("Auto-starting processing based on saved config")
+            self.toggle_processing(self.menu["야간 모드 시작"])
 
 
     def build_menu(self):
@@ -104,15 +115,63 @@ class NightModeApp(rumps.App):
                 rumps.MenuItem("종료", callback=rumps.quit_application)
             ]
             
-            # 초기 체크 설정
-            self.menu["압축 강도 (Threshold)"]["보통 (-20dB)"].state = True
-            self.menu["볼륨 증폭 (Gain)"]["보통 (+10dB)"].state = True
+            # 초기 체크 설정 (메모리 값 기반)
+            t_map = {-10.0: "약하게 (-10dB)", -20.0: "보통 (-20dB)", -30.0: "강하게 (-30dB)"}
+            g_map = {0.0: "낮게 (0dB)", 10.0: "보통 (+10dB)", 20.0: "높게 (+20dB)"}
+            
+            if self.threshold_db in t_map:
+                self.menu["압축 강도 (Threshold)"][t_map[self.threshold_db]].state = True
+            else:
+                self.menu["압축 강도 (Threshold)"]["보통 (-20dB)"].state = True
+                
+            if self.makeup_gain_db in g_map:
+                self.menu["볼륨 증폭 (Gain)"][g_map[self.makeup_gain_db]].state = True
+            else:
+                self.menu["볼륨 증폭 (Gain)"]["보통 (+10dB)"].state = True
+                
             logging.info("Menu built successfully")
         except Exception as e:
             logging.error(f"Menu build failed: {e}")
             raise e
 
-    # --- 자동 실행 관리 ---
+    # --- 설정 파일 관리 (JSON) ---
+    def get_config_path(self):
+        return Path.home() / ".night_mode_config.json"
+
+    def load_config(self):
+        config_path = self.get_config_path()
+        if config_path.exists():
+            try:
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                    self.saved_device_name = config.get("output_device_name")
+                    self.should_auto_start_processing = config.get("is_running", False)
+                    self.threshold_db = config.get("threshold_db", -20.0)
+                    self.makeup_gain_db = config.get("makeup_gain_db", 10.0)
+                logging.info(f"Config loaded: {config}")
+            except Exception as e:
+                logging.error(f"Failed to load config: {e}")
+
+    def save_config(self):
+        try:
+            # 출력 장치 이름 찾기
+            current_device_name = None
+            if self.output_device is not None and self.output_device < len(self.devices):
+                current_device_name = self.devices[self.output_device]['name']
+
+            config = {
+                "output_device_name": current_device_name or self.saved_device_name,
+                "is_running": self.is_running,
+                "threshold_db": self.threshold_db,
+                "makeup_gain_db": self.makeup_gain_db
+            }
+            with open(self.get_config_path(), 'w') as f:
+                json.dump(config, f)
+            logging.debug(f"Config saved: {config}")
+        except Exception as e:
+            logging.error(f"Failed to save config: {e}")
+
+    # --- 자동 실행 관리 (Launch Agent) ---
     def get_plist_path(self):
         return Path.home() / "Library" / "LaunchAgents" / "com.lizstudio.nightmodeaudio.plist"
 
@@ -122,20 +181,14 @@ class NightModeApp(rumps.App):
     def toggle_auto_start(self, sender):
         plist_path = self.get_plist_path()
         if sender.state:
-            # 비활성화
             if plist_path.exists():
                 plist_path.unlink()
             sender.state = False
             logging.info("Auto-start disabled")
         else:
-            # 활성화
             try:
-                # 현재 실행 중인 앱 경로 찾기
                 if getattr(sys, 'frozen', False):
-                    # .app 패키지 안의 실제 실행 파일 경로는 Contents/MacOS/NightModeAudio 임
-                    # 하지만 Launch Agent는 .app 자체를 여는 것이 나을 수 있음
                     executable_path = sys.executable
-                    # 만약 .app 내부에 있다면 패키지 경로를 사용
                     if ".app/Contents/MacOS/" in executable_path:
                         app_path = executable_path.split(".app/Contents/MacOS/")[0] + ".app"
                     else:
@@ -163,14 +216,11 @@ class NightModeApp(rumps.App):
     # --- 장치 관리 ---
     def refresh_devices(self, _):
         self.devices = sd.query_devices()
-        
-        # 출력 메뉴 리빌딩
         out_menu = self.menu["출력 장치 선택"]
         out_menu.clear()
         out_menu.add(rumps.MenuItem("목록 새로고침", callback=self.refresh_devices))
         out_menu.add(rumps.separator)
 
-        # BlackHole 찾기 (입력 고정)
         self.input_device = None
         
         for i, dev in enumerate(self.devices):
@@ -180,6 +230,11 @@ class NightModeApp(rumps.App):
             if dev['max_output_channels'] > 0:
                 if "BlackHole" not in dev['name']:
                     item = rumps.MenuItem(dev['name'], callback=self.select_output)
+                    # 저장된 장치 이름과 일치하면 자동 선택
+                    if self.saved_device_name and dev['name'] == self.saved_device_name:
+                        item.state = True
+                        self.output_device = i
+                        logging.info(f"Auto-selected saved device: {dev['name']}")
                     out_menu.add(item)
         
         if self.input_device is None:
@@ -195,6 +250,8 @@ class NightModeApp(rumps.App):
         for i, dev in enumerate(self.devices):
             if dev['name'] == sender.title and dev['max_output_channels'] > 0:
                 self.output_device = i
+                self.saved_device_name = dev['name'] # 이름 저장
+                self.save_config()
                 break
         
         if self.is_running:
@@ -206,6 +263,7 @@ class NightModeApp(rumps.App):
         self.threshold_db = db
         for item in self.menu["압축 강도 (Threshold)"].values():
             item.state = (item.title == item_title)
+        self.save_config()
 
     def set_threshold_weak(self, sender): self.set_threshold(-10.0, sender.title)
     def set_threshold_normal(self, sender): self.set_threshold(-20.0, sender.title)
@@ -215,6 +273,7 @@ class NightModeApp(rumps.App):
         self.makeup_gain_db = db
         for item in self.menu["볼륨 증폭 (Gain)"].values():
             item.state = (item.title == item_title)
+        self.save_config()
 
     def set_gain_low(self, sender): self.set_gain(0.0, sender.title)
     def set_gain_normal(self, sender): self.set_gain(10.0, sender.title)
@@ -228,7 +287,8 @@ class NightModeApp(rumps.App):
             sender.state = False
         else:
             if self.output_device is None:
-                rumps.alert("알림", "출력 장치를 먼저 선택해주세요!")
+                if not self.should_auto_start_processing: # 자동 시작 중이 아닐 때만 경고
+                    rumps.alert("알림", "출력 장치를 먼저 선택해주세요!")
                 return
             
             success = self.start_audio()
@@ -237,6 +297,8 @@ class NightModeApp(rumps.App):
                 sender.state = True
                 self.icon = resource_path("menu_icon_on.png")
                 self.title = None
+        
+        self.save_config()
 
     def start_audio(self):
         try:
@@ -280,7 +342,7 @@ class NightModeApp(rumps.App):
             self.is_running = True
             return True
         except Exception as e:
-            rumps.alert("오류 발생", str(e))
+            logging.error(f"Audio stream error: {e}")
             self.is_running = False
             return False
 
@@ -296,6 +358,7 @@ class NightModeApp(rumps.App):
 if __name__ == "__main__":
     logging.info("Starting application...")
     try:
-        NightModeApp().run()
+        app = NightModeApp()
+        app.run()
     except Exception as e:
         logging.critical(f"Application crashed: {e}", exc_info=True)
