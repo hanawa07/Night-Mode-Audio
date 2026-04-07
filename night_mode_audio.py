@@ -32,6 +32,8 @@ def resource_path(relative_path):
 # 앱 이름 및 아이콘 설정 (빌드 시 아이콘 적용됨)
 APP_NAME = "Night Mode"
 DEFAULT_OUTPUT_LABEL = "시스템 기본 출력 장치"
+OUTPUT_MODE_AUTO = "auto"
+OUTPUT_MODE_MANUAL = "manual"
 
 # 디버그 로깅 설정 (사용자 홈 디렉토리에 로그 파일 생성)
 log_file = os.path.expanduser("~/night_mode_debug.log")
@@ -59,9 +61,13 @@ class NightModeApp(rumps.App):
         self.makeup_gain_db = 10.0
         self.ratio = 4.0
         self.saved_device_name = None
+        self.last_physical_output_name = None
         self.should_auto_start_processing = False
         self.selected_output_name = None
         self.default_output_item = None
+        self.output_mode = OUTPUT_MODE_AUTO
+        self.last_resolved_output_device = None
+        self.default_output_watcher = None
 
         # 설정 로드
         self.load_config()
@@ -100,6 +106,10 @@ class NightModeApp(rumps.App):
             output_menu = rumps.MenuItem("출력 장치 선택")
             output_menu.add(rumps.MenuItem("목록 새로고침", callback=self.refresh_devices))
             output_menu.add(rumps.separator)
+
+            output_mode_menu = rumps.MenuItem("출력 장치 모드")
+            output_mode_menu.add(rumps.MenuItem("자동", callback=self.set_output_mode_auto))
+            output_mode_menu.add(rumps.MenuItem("수동", callback=self.set_output_mode_manual))
             
             # 5. Settings Submenu
             settings_menu = rumps.MenuItem("설정")
@@ -112,6 +122,7 @@ class NightModeApp(rumps.App):
                 threshold_menu,
                 gain_menu,
                 rumps.separator,
+                output_mode_menu,
                 output_menu,
                 settings_menu,
                 rumps.separator,
@@ -131,6 +142,9 @@ class NightModeApp(rumps.App):
                 self.menu["볼륨 증폭 (Gain)"][g_map[self.makeup_gain_db]].state = True
             else:
                 self.menu["볼륨 증폭 (Gain)"]["보통 (+10dB)"].state = True
+
+            self.menu["출력 장치 모드"]["자동"].state = (self.output_mode == OUTPUT_MODE_AUTO)
+            self.menu["출력 장치 모드"]["수동"].state = (self.output_mode == OUTPUT_MODE_MANUAL)
                 
             logging.info("Menu built successfully")
         except Exception as e:
@@ -148,9 +162,11 @@ class NightModeApp(rumps.App):
                 with open(config_path, 'r') as f:
                     config = json.load(f)
                     self.saved_device_name = config.get("output_device_name")
+                    self.last_physical_output_name = config.get("last_physical_output_name")
                     self.should_auto_start_processing = config.get("is_running", False)
                     self.threshold_db = config.get("threshold_db", -20.0)
                     self.makeup_gain_db = config.get("makeup_gain_db", 10.0)
+                    self.output_mode = config.get("output_mode", OUTPUT_MODE_AUTO)
                 logging.info(f"Config loaded: {config}")
             except Exception as e:
                 logging.error(f"Failed to load config: {e}")
@@ -167,9 +183,11 @@ class NightModeApp(rumps.App):
 
             config = {
                 "output_device_name": current_device_name or self.saved_device_name,
+                "last_physical_output_name": self.last_physical_output_name,
                 "is_running": self.is_running,
                 "threshold_db": self.threshold_db,
-                "makeup_gain_db": self.makeup_gain_db
+                "makeup_gain_db": self.makeup_gain_db,
+                "output_mode": self.output_mode
             }
             with open(self.get_config_path(), 'w') as f:
                 json.dump(config, f)
@@ -222,32 +240,175 @@ class NightModeApp(rumps.App):
     # --- 장치 관리 ---
     def get_default_output_index(self):
         try:
-            default_output = sd.default.device[1]
+            default_output_info = sd.query_devices(kind='output')
+            all_devices = sd.query_devices()
         except Exception as e:
             logging.error(f"Failed to read default output device: {e}")
             return None
 
-        if default_output is None or default_output < 0:
+        for i, dev in enumerate(all_devices):
+            if (
+                dev['name'] == default_output_info['name']
+                and dev['hostapi'] == default_output_info['hostapi']
+                and dev['max_output_channels'] > 0
+            ):
+                return i
+
+        logging.error(f"Failed to resolve default output device index: {default_output_info}")
+        return None
+
+    def is_blackhole_device(self, device_index):
+        if device_index is None or device_index < 0 or device_index >= len(self.devices):
+            return False
+        return "BlackHole" in self.devices[device_index]["name"]
+
+    def find_output_device_by_name(self, device_name):
+        if not device_name:
             return None
 
-        return int(default_output)
+        for i, dev in enumerate(self.devices):
+            if dev["name"] == device_name and dev["max_output_channels"] > 0 and "BlackHole" not in dev["name"]:
+                return i
+        return None
+
+    def get_safe_auto_output_index(self):
+        default_output = self.get_default_output_index()
+        if default_output is None:
+            fallback_output = self.find_output_device_by_name(self.last_physical_output_name)
+            if fallback_output is not None:
+                return fallback_output
+            return None
+
+        if not self.is_blackhole_device(default_output):
+            return default_output
+
+        fallback_output = self.find_output_device_by_name(self.last_physical_output_name)
+        if fallback_output is not None:
+            logging.info(
+                f"Auto mode ignored BlackHole default output; using last physical output {fallback_output}"
+            )
+            return fallback_output
+
+        if self.output_device is not None and not self.is_blackhole_device(self.output_device):
+            logging.info(
+                f"Auto mode ignored BlackHole default output; keeping current physical output {self.output_device}"
+            )
+            return self.output_device
+
+        logging.warning("Auto mode found BlackHole as default output and no fallback physical output is available")
+        return None
+
+    def sync_processing_ui(self):
+        toggle_item = self.menu["야간 모드 시작"]
+        if self.is_running:
+            toggle_item.title = "정지 (작동 중)"
+            toggle_item.state = True
+            self.icon = resource_path("menu_icon_on.png")
+        else:
+            toggle_item.title = "야간 모드 시작"
+            toggle_item.state = False
+            self.icon = resource_path("menu_icon.png")
+        self.title = None
 
     def get_selected_output_index(self):
+        if self.output_mode == OUTPUT_MODE_AUTO:
+            return self.get_safe_auto_output_index()
         if self.selected_output_name == DEFAULT_OUTPUT_LABEL:
-            return self.get_default_output_index()
+            return self.get_safe_auto_output_index()
         return self.output_device
 
     def update_selected_output_label(self):
-        if self.selected_output_name != DEFAULT_OUTPUT_LABEL or self.default_output_item is None:
+        if self.default_output_item is None:
             return
 
         default_index = self.get_default_output_index()
         if default_index is None or default_index >= len(self.devices):
-            self.default_output_item.title = DEFAULT_OUTPUT_LABEL
+            if self.output_mode == OUTPUT_MODE_AUTO:
+                self.default_output_item.title = f"{DEFAULT_OUTPUT_LABEL} (자동)"
+            else:
+                self.default_output_item.title = DEFAULT_OUTPUT_LABEL
             return
 
         default_name = self.devices[default_index]["name"]
-        self.default_output_item.title = f"{DEFAULT_OUTPUT_LABEL} ({default_name})"
+        if self.output_mode == OUTPUT_MODE_AUTO:
+            if self.is_blackhole_device(default_index):
+                if self.last_physical_output_name:
+                    self.default_output_item.title = (
+                        f"{DEFAULT_OUTPUT_LABEL} (자동: {self.last_physical_output_name}, 기본={default_name})"
+                    )
+                else:
+                    self.default_output_item.title = f"{DEFAULT_OUTPUT_LABEL} (자동 불가: {default_name})"
+            else:
+                self.default_output_item.title = f"{DEFAULT_OUTPUT_LABEL} (자동: {default_name})"
+        else:
+            self.default_output_item.title = f"{DEFAULT_OUTPUT_LABEL} ({default_name})"
+
+    def set_output_mode(self, mode):
+        self.output_mode = mode
+        self.menu["출력 장치 모드"]["자동"].state = (mode == OUTPUT_MODE_AUTO)
+        self.menu["출력 장치 모드"]["수동"].state = (mode == OUTPUT_MODE_MANUAL)
+        if mode == OUTPUT_MODE_AUTO:
+            self.selected_output_name = DEFAULT_OUTPUT_LABEL
+            self.saved_device_name = DEFAULT_OUTPUT_LABEL
+            resolved_output = self.get_safe_auto_output_index()
+            if resolved_output is not None:
+                self.output_device = resolved_output
+            if self.default_output_item is not None:
+                for item in self.menu["출력 장치 선택"].values():
+                    if isinstance(item, rumps.MenuItem):
+                        item.state = False
+                self.default_output_item.state = True
+            self.update_selected_output_label()
+            if resolved_output is None:
+                rumps.alert(
+                    "알림",
+                    "자동 모드는 기본 출력이 BlackHole일 때 바로 사용할 수 없습니다. "
+                    "실제 스피커/이어폰을 수동으로 선택해 주세요."
+                )
+        self.save_config()
+        if self.is_running:
+            self.stop_audio()
+            if self.get_selected_output_index() is not None:
+                self.start_audio()
+            self.sync_processing_ui()
+
+    def set_output_mode_auto(self, _):
+        self.set_output_mode(OUTPUT_MODE_AUTO)
+
+    def set_output_mode_manual(self, _):
+        self.set_output_mode(OUTPUT_MODE_MANUAL)
+
+    def watch_default_output(self, _):
+        if self.output_mode != OUTPUT_MODE_AUTO:
+            return
+
+        self.devices = sd.query_devices()
+        current_output = self.get_default_output_index()
+        if current_output is None:
+            return
+
+        if self.default_output_item is not None:
+            self.update_selected_output_label()
+
+        resolved_output = self.get_safe_auto_output_index()
+        if resolved_output is None:
+            if self.is_running:
+                logging.warning("Auto mode has no safe physical output; keeping current stream")
+            return
+
+        if self.last_resolved_output_device == resolved_output:
+            return
+
+        logging.info(f"Default output changed: {self.last_resolved_output_device} -> {resolved_output}")
+        self.output_device = resolved_output
+        self.last_resolved_output_device = resolved_output
+
+        if self.is_running:
+            self.stop_audio()
+            success = self.start_audio()
+            if not success:
+                logging.error("Failed to restart audio after default output change")
+            self.sync_processing_ui()
 
     def refresh_devices(self, _):
         self.devices = sd.query_devices()
@@ -282,9 +443,13 @@ class NightModeApp(rumps.App):
             self.default_output_item.state = True
             self.selected_output_name = DEFAULT_OUTPUT_LABEL
 
-        if self.selected_output_name is None:
+        if self.output_mode == OUTPUT_MODE_AUTO or self.selected_output_name is None:
             self.default_output_item.state = True
             self.selected_output_name = DEFAULT_OUTPUT_LABEL
+            self.saved_device_name = DEFAULT_OUTPUT_LABEL
+            resolved_output = self.get_safe_auto_output_index()
+            if resolved_output is not None:
+                self.output_device = resolved_output
 
         self.update_selected_output_label()
         
@@ -300,21 +465,32 @@ class NightModeApp(rumps.App):
 
         selected_title = sender.title
         if selected_title.startswith(DEFAULT_OUTPUT_LABEL):
-            self.output_device = None
+            self.output_mode = OUTPUT_MODE_AUTO
+            self.menu["출력 장치 모드"]["자동"].state = True
+            self.menu["출력 장치 모드"]["수동"].state = False
             self.selected_output_name = DEFAULT_OUTPUT_LABEL
             self.saved_device_name = DEFAULT_OUTPUT_LABEL
+            resolved_output = self.get_safe_auto_output_index()
+            if resolved_output is not None:
+                self.output_device = resolved_output
             self.update_selected_output_label()
             self.save_config()
             if self.is_running:
                 self.stop_audio()
-                self.start_audio()
+                if self.get_selected_output_index() is not None:
+                    self.start_audio()
+                self.sync_processing_ui()
             return
         
         for i, dev in enumerate(self.devices):
             if dev['name'] == sender.title and dev['max_output_channels'] > 0:
+                self.output_mode = OUTPUT_MODE_MANUAL
+                self.menu["출력 장치 모드"]["자동"].state = False
+                self.menu["출력 장치 모드"]["수동"].state = True
                 self.output_device = i
                 self.selected_output_name = dev['name']
                 self.saved_device_name = dev['name']
+                self.last_physical_output_name = dev['name']
                 self.save_config()
                 break
         
@@ -347,20 +523,15 @@ class NightModeApp(rumps.App):
     def toggle_processing(self, sender):
         if self.is_running:
             self.stop_audio()
-            sender.title = "야간 모드 시작"
-            sender.state = False
         else:
             if self.get_selected_output_index() is None:
                 if not self.should_auto_start_processing: # 자동 시작 중이 아닐 때만 경고
                     rumps.alert("알림", "출력 장치를 먼저 선택해주세요!")
                 return
             
-            success = self.start_audio()
-            if success:
-                sender.title = "정지 (작동 중)"
-                sender.state = True
-                self.icon = resource_path("menu_icon_on.png")
-                self.title = None
+            self.start_audio()
+        
+        self.sync_processing_ui()
         
         self.save_config()
 
@@ -409,12 +580,16 @@ class NightModeApp(rumps.App):
             )
             self.stream.start()
             self.output_device = selected_output
+            self.last_resolved_output_device = selected_output
+            if not self.is_blackhole_device(selected_output):
+                self.last_physical_output_name = self.devices[selected_output]["name"]
             self.update_selected_output_label()
             self.is_running = True
             return True
         except Exception as e:
             logging.error(f"Audio stream error: {e}")
             self.is_running = False
+            self.stream = None
             return False
 
     def stop_audio(self):
@@ -423,13 +598,14 @@ class NightModeApp(rumps.App):
             self.stream.close()
             self.stream = None
         self.is_running = False
-        self.title = None
-        self.icon = resource_path("menu_icon.png")
+        self.sync_processing_ui()
 
 if __name__ == "__main__":
     logging.info("Starting application...")
     try:
         app = NightModeApp()
+        app.default_output_watcher = rumps.Timer(app.watch_default_output, 2)
+        app.default_output_watcher.start()
         app.run()
     except Exception as e:
         logging.critical(f"Application crashed: {e}", exc_info=True)
