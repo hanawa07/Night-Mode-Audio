@@ -28,6 +28,25 @@ brew install blackhole-2ch
 4. "확인되지 않은 개발자가..." 경고창이 뜨면 **열기**를 누르세요.
 5. 마이크 권한 요청이 뜨면 **허용**해주세요. (오디오를 캡처하기 위해 필요합니다)
 
+## 📦 배포용 앱 만들기
+
+개발 머신에서 아래 명령으로 macOS 앱 번들과 배포용 zip을 만듭니다.
+
+```bash
+./build_app.sh
+```
+
+생성 결과:
+
+- `dist/NightModeAudio.app`
+- `NightModeAudio-macOS.zip`
+
+앱을 로컬에 설치하려면:
+
+```bash
+./install_app.sh
+```
+
 ### 3. 문제 해결
 앱이 "손상되었거나 열 수 없습니다"라고 뜬다면, 터미널을 열고 아래 명령어를 입력하세요:
 ```bash

@@ -1,13 +1,23 @@
 #!/bin/bash
+set -euo pipefail
+
 echo "=== 야간 모드 오디오 앱 설치 ==="
 
 # 스크립트가 있는 경로를 기준으로 설정
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_NAME="NightModeAudio.app"
+ZIP_NAME="NightModeAudio-macOS.zip"
 SOURCE="$SCRIPT_DIR/dist/$APP_NAME"
 DEST="/Applications/$APP_NAME"
 
 # 1. 앱 이동
+if [ ! -d "$SOURCE" ] && [ -f "$SCRIPT_DIR/$ZIP_NAME" ]; then
+    echo "압축본에서 앱을 복원합니다..."
+    rm -rf "$SCRIPT_DIR/dist/$APP_NAME"
+    mkdir -p "$SCRIPT_DIR/dist"
+    ditto -x -k "$SCRIPT_DIR/$ZIP_NAME" "$SCRIPT_DIR/dist"
+fi
+
 if [ -d "$SOURCE" ]; then
     echo "1. 앱을 응용 프로그램 폴더로 이동합니다..."
     
@@ -26,7 +36,7 @@ if [ -d "$SOURCE" ]; then
     
     echo "   -> 이동 완료: $DEST"
 else
-    echo "오류: 빌드된 앱($SOURCE)을 찾을 수 없습니다."
+    echo "오류: 빌드된 앱($SOURCE) 또는 압축본($SCRIPT_DIR/$ZIP_NAME)을 찾을 수 없습니다."
     exit 1
 fi
 
