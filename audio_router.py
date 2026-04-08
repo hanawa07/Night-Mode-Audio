@@ -24,17 +24,11 @@ class AudioRouter:
                 return index
         return None
 
-    def find_output_by_name(self, device_name: str) -> int | None:
-        for index, device in enumerate(sd.query_devices()):
-            if device["name"] == device_name and device["max_output_channels"] > 0 and "BlackHole" not in device["name"]:
-                return index
-        return None
-
-    def start(self, output_name: str) -> bool:
+    def start(self, output_index: int) -> bool:
+        """sounddevice 인덱스를 직접 받아 스트림을 연다. 이름 매칭 없음."""
         input_index = self.find_blackhole_input()
-        output_index = self.find_output_by_name(output_name)
-        if input_index is None or output_index is None:
-            self.logger.error(f"Failed to resolve audio route input={input_index}, output={output_name}")
+        if input_index is None:
+            self.logger.error("BlackHole 입력 장치를 찾을 수 없음")
             return False
 
         try:
@@ -46,6 +40,7 @@ class AudioRouter:
                 int(input_info["max_input_channels"]),
                 int(output_info["max_output_channels"]),
             )
+            output_name = output_info["name"]
 
             def callback(indata, outdata, _frames, _time, _status):
                 rms = np.sqrt(np.mean(indata.flatten() ** 2))
@@ -73,10 +68,12 @@ class AudioRouter:
             )
             self.stream.start()
             self.current_output_name = output_name
-            self.logger.info(f"Audio stream started: {output_name}")
+            self.logger.info(
+                f"오디오 스트림 시작: sd_index={output_index} name={output_name}"
+            )
             return True
         except Exception as exc:
-            self.logger.error(f"Audio stream error: {exc}")
+            self.logger.error(f"오디오 스트림 오류: {exc}")
             self.stream = None
             self.current_output_name = None
             return False
@@ -86,8 +83,8 @@ class AudioRouter:
             self.stream.stop()
             self.stream.close()
             self.stream = None
-        self.current_output_name = None
+            self.current_output_name = None
 
-    def restart(self, output_name: str) -> bool:
+    def restart(self, output_index: int) -> bool:
         self.stop()
-        return self.start(output_name)
+        return self.start(output_index)

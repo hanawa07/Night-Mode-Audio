@@ -252,6 +252,50 @@ class DeviceManager:
                 return device
         return None
 
+    def get_sd_index(self, uid: str) -> int | None:
+        """CoreAudio UID를 sounddevice 인덱스로 변환.
+
+        PortAudio와 CoreAudio 모두 HAL에서 장치 이름을 가져오므로
+        device.name으로 직접 매핑한다.
+        """
+        import sounddevice as sd
+
+        device = self.devices_by_uid.get(uid)
+        if device is None:
+            self.logger.error(f"UID {uid}를 장치 캐시에서 찾을 수 없음")
+            return None
+
+        target_name = device.name
+
+        ca_hostapi = None
+        for i, h in enumerate(sd.query_hostapis()):
+            if "Core Audio" in h["name"]:
+                ca_hostapi = i
+                break
+        if ca_hostapi is None:
+            self.logger.error("sounddevice에서 Core Audio 호스트 API를 찾을 수 없음")
+            return None
+
+        for sd_idx, dev in enumerate(sd.query_devices()):
+            if dev["hostapi"] != ca_hostapi:
+                continue
+            if dev["name"] == target_name and dev["max_output_channels"] > 0:
+                self.logger.debug(
+                    f"UID {uid} → name={target_name!r} → sd_index {sd_idx}"
+                )
+                return sd_idx
+
+        sd_names = [
+            dev["name"]
+            for dev in sd.query_devices()
+            if dev["hostapi"] == ca_hostapi
+        ]
+        self.logger.error(
+            f"UID {uid} (name={target_name!r})에 대응하는 sounddevice 인덱스를 찾을 수 없음. "
+            f"sounddevice Core Audio 장치 목록: {sd_names}"
+        )
+        return None
+
     def _get_device_ids(self) -> list[int]:
         address = self._address(kAudioHardwarePropertyDevices)
         size = ctypes.c_uint32(0)
@@ -277,7 +321,7 @@ class DeviceManager:
             ctypes.byref(buffer),
         )
         if status != 0:
-            self.logger.error(f"Failed to read CoreAudio device list: {status}")
+            self.logger.error(f"CoreAudio 장치 목록 읽기 실패: {status}")
             return []
 
         return [int(buffer[idx]) for idx in range(count)]

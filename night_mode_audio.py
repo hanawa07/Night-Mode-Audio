@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import rumps
+from PyObjCTools import AppHelper
 
 from audio_router import AudioRouter
 from auto_selector import AutoSelector
@@ -46,6 +47,7 @@ logging.basicConfig(
 class NightModeApp(rumps.App):
     def __init__(self):
         super().__init__(APP_NAME, icon=resource_path("menu_icon.png"), quit_button=None)
+        logging.info("Rumps init successful")
 
         self.threshold_db = -20.0
         self.makeup_gain_db = 10.0
@@ -57,8 +59,10 @@ class NightModeApp(rumps.App):
         self.current_output_uid = None
         self.output_menu_items = {}
         self.previous_auto_uids = set()
+        self._startup_timer = None
 
         self.load_config()
+        logging.info(f"Config loaded: {self.config_data}")
 
         recent_connected = self.config_data.get("physical_output_history", [])
         last_success_uid = self.config_data.get("last_success_uid")
@@ -68,13 +72,28 @@ class NightModeApp(rumps.App):
         self.device_manager = DeviceManager(logging.getLogger(__name__), on_change=self.handle_devices_changed)
 
         self.build_menu()
+        logging.info("Menu built successfully")
         self.device_manager.start()
+        logging.info("Device manager started")
         self.handle_devices_changed()
+        logging.info("Initial device sync completed")
 
         self.menu["설정"]["로그인 시 자동 실행"].state = self.is_auto_start_enabled()
 
         if self.should_auto_start_processing:
-            self.start_processing()
+            logging.info("Scheduling deferred auto-start")
+            self._startup_timer = rumps.Timer(self._deferred_auto_start_timer, 0.5)
+            self._startup_timer.start()
+
+    def _deferred_auto_start_timer(self, _sender):
+        if self._startup_timer is not None:
+            self._startup_timer.stop()
+            self._startup_timer = None
+        self.defer_auto_start()
+
+    def defer_auto_start(self):
+        logging.info("Deferred auto-start fired")
+        self.start_processing()
 
     @property
     def config_data(self):
@@ -273,15 +292,54 @@ class NightModeApp(rumps.App):
             return self.resolve_auto_device()
         return self.device_manager.get_device(self.manual_output_uid)
 
-    def start_processing(self, restart: bool = False):
+    def start_processing(self, restart: bool = False) -> bool:
+        logging.info(f"start_processing called restart={restart} is_running={self.is_running} mode={self.output_mode}")
+        try:
+            return self._start_processing_inner(restart)
+        except Exception:
+            logging.exception("start_processing 예외 발생")
+            self.stop_processing()
+            return False
+
+    def _start_processing_inner(self, restart: bool) -> bool:
         target = self.resolve_target_device()
         if target is None:
+            logging.error("No target device resolved")
             rumps.alert("알림", "사용 가능한 출력 장치가 없습니다.")
             self.stop_processing()
             return False
 
+        # UID → sounddevice 인덱스 변환
+        sd_index = self.device_manager.get_sd_index(target.uid)
+        if sd_index is None:
+            # PortAudio는 Pa_Initialize() 시점의 장치 목록을 고정함.
+            # Bluetooth 장치 등 이후 연결된 장치는 재초기화 후에만 보임.
+            logging.debug(f"'{target.name}' sounddevice 미발견 - PortAudio 재초기화 시도")
+            self.audio_router.stop()  # 재초기화 전 스트림 반드시 중단
+            import sounddevice as sd
+            try:
+                sd._terminate()
+                sd._initialize()
+                logging.debug("PortAudio 재초기화 완료")
+            except Exception:
+                logging.exception("PortAudio 재초기화 실패")
+                self.stop_processing()
+                return False
+            sd_index = self.device_manager.get_sd_index(target.uid)
+
+        if sd_index is None:
+            logging.error(
+                f"UID를 sounddevice 인덱스로 변환 실패: uid={target.uid} name={target.name}"
+            )
+            self.stop_processing()
+            return False
+
         self.audio_router.configure(self.threshold_db, self.makeup_gain_db, self.ratio)
-        success = self.audio_router.restart(target.name) if restart or self.is_running else self.audio_router.start(target.name)
+        success = (
+            self.audio_router.restart(sd_index)
+            if restart or self.is_running
+            else self.audio_router.start(sd_index)
+        )
         if not success:
             self.stop_processing()
             return False
@@ -291,6 +349,7 @@ class NightModeApp(rumps.App):
         self.auto_selector.note_success(target.uid)
         self.sync_processing_ui()
         self.save_config()
+        logging.info(f"처리 시작: uid={target.uid} name={target.name} sd_index={sd_index}")
         return True
 
     def stop_processing(self):
