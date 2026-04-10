@@ -74,6 +74,11 @@ class AudioRouter:
             return True
         except Exception as exc:
             self.logger.error(f"오디오 스트림 오류: {exc}")
+            if self.stream is not None:
+                try:
+                    self.stream.close()
+                except Exception:
+                    self.logger.exception("실패한 오디오 스트림 정리 중 오류")
             self.stream = None
             self.current_output_name = None
             return False
