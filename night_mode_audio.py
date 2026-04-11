@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import plistlib
+import time
 import sys
 from pathlib import Path
 
@@ -302,6 +303,7 @@ class NightModeApp(rumps.App):
             return False
 
     def _start_processing_inner(self, restart: bool) -> bool:
+        previous_output_uid = self.current_output_uid
         target = self.resolve_target_device()
         if target is None:
             logging.error("No target device resolved")
@@ -309,28 +311,15 @@ class NightModeApp(rumps.App):
             self.stop_processing()
             return False
 
-        # UID → sounddevice 인덱스 변환
-        sd_index = self.device_manager.get_sd_index(target.uid)
-        if sd_index is None:
-            # PortAudio는 Pa_Initialize() 시점의 장치 목록을 고정함.
-            # Bluetooth 장치 등 이후 연결된 장치는 재초기화 후에만 보임.
-            logging.debug(f"'{target.name}' sounddevice 미발견 - PortAudio 재초기화 시도")
-            self.audio_router.stop()  # 재초기화 전 스트림 반드시 중단
-            import sounddevice as sd
-            try:
-                sd._terminate()
-                sd._initialize()
-                logging.debug("PortAudio 재초기화 완료")
-            except Exception:
-                logging.exception("PortAudio 재초기화 실패")
-                self.stop_processing()
-                return False
-            sd_index = self.device_manager.get_sd_index(target.uid)
+        sd_index = self.resolve_sd_index_with_refresh(target.uid, target.name)
 
         if sd_index is None:
             logging.error(
                 f"UID를 sounddevice 인덱스로 변환 실패: uid={target.uid} name={target.name}"
             )
+            if restart and self.is_running:
+                logging.debug("자동 전환 실패 - 기존 스트림 유지")
+                return False
             self.stop_processing()
             return False
 
@@ -345,19 +334,55 @@ class NightModeApp(rumps.App):
             success = self.retry_start_after_portaudio_reset(target.uid, restart=False)
 
         if not success:
+            if restart and self.is_running:
+                logging.debug("스트림 재시작 실패 - 기존 서비스 상태 유지")
+                return False
             self.stop_processing()
             return False
 
         self.is_running = True
-        self.current_output_uid = target.uid
-        self.auto_selector.note_success(target.uid)
+        if restart and previous_output_uid is not None and self.audio_router.current_output_index != sd_index:
+            self.current_output_uid = previous_output_uid
+            self.auto_selector.note_success(previous_output_uid)
+            logging.debug(
+                f"기존 출력 복구 유지: previous_uid={previous_output_uid} "
+                f"requested_uid={target.uid} actual_sd_index={self.audio_router.current_output_index}"
+            )
+        else:
+            self.current_output_uid = target.uid
+            self.auto_selector.note_success(target.uid)
         self.sync_processing_ui()
         self.save_config()
         logging.info(f"처리 시작: uid={target.uid} name={target.name} sd_index={sd_index}")
         return True
 
+    def resolve_sd_index_with_refresh(self, target_uid: str, target_name: str) -> int | None:
+        sd_index = self.device_manager.get_sd_index(target_uid)
+        if sd_index is not None:
+            return sd_index
+
+        logging.debug(f"'{target_name}' sounddevice 미발견 - PortAudio 재초기화 시도")
+        try:
+            import sounddevice as sd
+
+            sd._terminate()
+            sd._initialize()
+            logging.debug("PortAudio 재초기화 완료")
+        except Exception:
+            logging.exception("PortAudio 재초기화 실패")
+            return None
+
+        for attempt in range(3):
+            self.device_manager.refresh()
+            sd_index = self.device_manager.get_sd_index(target_uid)
+            if sd_index is not None:
+                return sd_index
+            if attempt < 2:
+                time.sleep(0.2)
+
+        return None
+
     def retry_start_after_portaudio_reset(self, target_uid: str, restart: bool) -> bool:
-        self.audio_router.stop()
         try:
             import sounddevice as sd
 
@@ -368,8 +393,15 @@ class NightModeApp(rumps.App):
             logging.exception("PortAudio 재초기화 실패")
             return False
 
-        self.device_manager.refresh()
-        sd_index = self.device_manager.get_sd_index(target_uid)
+        sd_index = None
+        for attempt in range(3):
+            self.device_manager.refresh()
+            sd_index = self.device_manager.get_sd_index(target_uid)
+            if sd_index is not None:
+                break
+            if attempt < 2:
+                time.sleep(0.2)
+
         if sd_index is None:
             target = self.device_manager.get_device(target_uid)
             logging.error(

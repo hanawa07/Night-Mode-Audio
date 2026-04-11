@@ -9,6 +9,7 @@ class AudioRouter:
         self.logger = logger
         self.stream = None
         self.current_output_name = None
+        self.current_output_index = None
         self.threshold_db = -20.0
         self.makeup_gain_db = 10.0
         self.ratio = 4.0
@@ -68,6 +69,7 @@ class AudioRouter:
             )
             self.stream.start()
             self.current_output_name = output_name
+            self.current_output_index = output_index
             self.logger.info(
                 f"오디오 스트림 시작: sd_index={output_index} name={output_name}"
             )
@@ -81,15 +83,30 @@ class AudioRouter:
                     self.logger.exception("실패한 오디오 스트림 정리 중 오류")
             self.stream = None
             self.current_output_name = None
+            self.current_output_index = None
             return False
 
     def stop(self):
         if self.stream is not None:
             self.stream.stop()
             self.stream.close()
-            self.stream = None
-            self.current_output_name = None
+        self.stream = None
+        self.current_output_name = None
+        self.current_output_index = None
 
     def restart(self, output_index: int) -> bool:
+        previous_stream = self.stream
+        previous_output_name = self.current_output_name
+        previous_output_index = self.current_output_index
         self.stop()
-        return self.start(output_index)
+        if self.start(output_index):
+            return True
+
+        if previous_stream is not None and previous_output_index is not None:
+            self.logger.debug(
+                f"새 출력 전환 실패 - 기존 출력으로 복구 시도: "
+                f"sd_index={previous_output_index} name={previous_output_name}"
+            )
+            return self.start(previous_output_index)
+
+        return False
