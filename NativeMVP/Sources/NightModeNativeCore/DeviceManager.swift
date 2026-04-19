@@ -233,3 +233,38 @@ public func readDefaultOutputDeviceID() -> AudioDeviceID? {
     }
     return deviceID
 }
+
+private func setSystemAudioDevice(
+    selector: AudioObjectPropertySelector,
+    deviceID: AudioDeviceID
+) -> Bool {
+    var address = AudioObjectPropertyAddress(
+        mSelector: selector,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var mutableDeviceID = deviceID
+    let size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    let status = AudioObjectSetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject),
+        &address,
+        0,
+        nil,
+        size,
+        &mutableDeviceID
+    )
+    return status == noErr
+}
+
+@discardableResult
+public func setDefaultOutputDeviceID(_ deviceID: AudioDeviceID) -> Bool {
+    let defaultOutputOK = setSystemAudioDevice(
+        selector: kAudioHardwarePropertyDefaultOutputDevice,
+        deviceID: deviceID
+    )
+    let systemOutputOK = setSystemAudioDevice(
+        selector: kAudioHardwarePropertyDefaultSystemOutputDevice,
+        deviceID: deviceID
+    )
+    return defaultOutputOK || systemOutputOK
+}

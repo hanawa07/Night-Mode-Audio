@@ -882,6 +882,7 @@ final class AppEngineController {
         let previousSignature = menuStateSignature
         captureCurrentOutputVolume()
         refreshDeviceCache()
+        _ = ensureBlackHoleAsSystemOutput()
 
         if outputMode == .auto, isRunning {
             let resolvedUID = resolveAutoDevice()?.uid
@@ -1060,9 +1061,10 @@ final class AppEngineController {
     private func start(target: AudioDevice) throws {
         captureCurrentOutputVolume()
         stopEngineOnly()
-        guard let inputDevice = listDevices().first(where: { $0.hasInput && $0.name.contains("BlackHole") }) else {
+        guard let inputDevice = findBlackHoleDevice() else {
             throw PassThroughError.blackHoleMissing
         }
+        let blackHoleRecovered = ensureBlackHoleAsSystemOutput()
         let engine = try PassThroughEngine(
             inputDeviceID: inputDevice.id,
             outputDeviceID: target.id,
@@ -1078,7 +1080,11 @@ final class AppEngineController {
         lastSuccessUID = target.uid
         noteConnected(target.uid)
         persistSelectorState()
-        statusDetail = "출력: \(target.displayName) / \(latencyMode(for: target.uid).title)"
+        if blackHoleRecovered {
+            statusDetail = "출력: \(target.displayName) / \(latencyMode(for: target.uid).title)"
+        } else {
+            statusDetail = "출력: \(target.displayName) / BlackHole 기본 출력 확인 필요"
+        }
     }
 
     private func stopEngineOnly() {
@@ -1122,6 +1128,29 @@ final class AppEngineController {
         if recentConnected.count > 10 {
             recentConnected = Array(recentConnected.prefix(10))
         }
+    }
+
+    private func findBlackHoleDevice() -> AudioDevice? {
+        listDevices().first { $0.hasInput && $0.hasOutput && $0.name.contains("BlackHole") }
+    }
+
+    @discardableResult
+    private func ensureBlackHoleAsSystemOutput() -> Bool {
+        guard isRunning || shouldAutoStartProcessing else { return true }
+        guard let blackHole = findBlackHoleDevice() else {
+            statusDetail = "BlackHole 장치를 찾지 못했습니다"
+            return false
+        }
+
+        if readDefaultOutputDeviceID() == blackHole.id {
+            return true
+        }
+
+        let restored = setDefaultOutputDeviceID(blackHole.id)
+        if !restored {
+            statusDetail = "시스템 출력을 BlackHole로 복구하지 못했습니다"
+        }
+        return restored
     }
 
     private func captureCurrentOutputVolume() {
