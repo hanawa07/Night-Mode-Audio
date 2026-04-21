@@ -125,11 +125,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button else { return }
         button.title = ""
         button.toolTip = "Night Mode Native"
-        let imageName = engineController.isRunning ? "menu_icon_on.png" : "menu_icon.png"
-        if let url = Bundle.module.url(forResource: imageName.replacingOccurrences(of: ".png", with: ""), withExtension: "png"),
-           let image = NSImage(contentsOf: url) {
+        let symbolName = engineController.isRunning ? "moon.fill" : "moon"
+        if let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil) {
             image.size = NSSize(width: 18, height: 18)
-            image.isTemplate = false
+            image.isTemplate = true
             button.image = image
         } else {
             button.image = nil
